@@ -37,6 +37,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
 )
 from litellm.proxy.spend_tracking.spend_counter_batch import PendingSpendIncrement, spend_counter_batch_scope
 from litellm.proxy.utils import PrismaClient, ProxyLogging
+from litellm.responses.litellm_completion_transformation.transformation import LiteLLMCompletionResponsesConfig
 from litellm.router import Router
 from litellm.rust_bridge.token_counter import RustTokenizer, count_input_tokens, rust_tokenizer
 from litellm.types.proxy.model_access_group_budget import ModelAccessGroupBudget
@@ -1460,7 +1461,9 @@ async def count_request_input_tokens(
         {
             tokenizer: count.input_tokens
             for tokenizer in distinct_tokenizers
-            if raw_body is not None and (count := await count_input_tokens(raw_body, tokenizer)) is not None
+            if raw_body is not None
+            and "input" not in request_body
+            and (count := await count_input_tokens(raw_body, tokenizer)) is not None
         }
     )
     rust_counts: Final = MappingProxyType(
@@ -1526,7 +1529,13 @@ def _count_input_tokens(request_body: dict, model: str) -> int | None:
         if "prompt" in request_body:
             return _count_text_tokens(model=model, text=request_body.get("prompt"))
         if "input" in request_body:
-            return _count_text_tokens(model=model, text=request_body.get("input"))
+            messages: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+                input=request_body["input"], responses_api_request=request_body
+            )
+            tools, _ = LiteLLMCompletionResponsesConfig.transform_responses_api_tools_to_chat_completion_tools(
+                tools=request_body.get("tools") or []
+            )
+            return litellm.token_counter(model=model, messages=messages, tools=tools)
         if "query" in request_body or "documents" in request_body:
             query_tokens: Final = _count_text_tokens(model=model, text=request_body.get("query"))
             document_tokens: Final = _count_text_tokens(

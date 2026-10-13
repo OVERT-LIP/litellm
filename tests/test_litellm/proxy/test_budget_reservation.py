@@ -1,12 +1,17 @@
 import asyncio
+import base64
+import io
+import json
 import threading
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 
 import litellm
 from litellm.caching.dual_cache import DualCache
@@ -39,7 +44,9 @@ from litellm.proxy.common_utils.user_api_key_cache import (
 from litellm.proxy.spend_tracking.budget_reservation import (
     TOKENIZE_OFF_EVENT_LOOP_MIN_CHARS,
     _approximate_input_size,
+    _count_input_tokens,
     _get_model_access_group_budget_counters,
+    count_request_input_tokens,
     estimate_request_max_cost,
     get_budget_window_start,
     invalidate_budget_reservation_counters,
@@ -50,6 +57,52 @@ from litellm.proxy.spend_tracking.budget_reservation import (
 from litellm.proxy.utils import ProxyLogging
 from litellm.router import Router
 from litellm.types.proxy.model_access_group_budget import ModelAccessGroupBudget
+
+
+@pytest.mark.parametrize("kind", ["image", "file"])
+def test_responses_media_reservation_matches_chat_without_tokenizing_base64(kind: str) -> None:
+    buffer: Final = io.BytesIO()
+    Image.new("RGB", (512, 512), "blue").save(buffer, format="PNG", compress_level=0)
+    data: Final = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    response_part: Final = (
+        {"type": "input_image", "image_url": data, "detail": "high"}
+        if kind == "image"
+        else {"type": "input_file", "file_data": data, "filename": "image.png"}
+    )
+    chat_part: Final = (
+        {"type": "image_url", "image_url": {"url": data, "detail": "high"}}
+        if kind == "image"
+        else {"type": "file", "file": {"file_data": data, "filename": "image.png"}}
+    )
+    model: Final = "gpt-6-astra"
+    expected: Final = litellm.token_counter(
+        model=model,
+        messages=[{"role": "user", "content": [{"type": "text", "text": "Describe"}, chat_part]}],
+    )
+    actual: Final = _count_input_tokens(
+        {"input": [{"role": "user", "content": [{"type": "input_text", "text": "Describe"}, response_part]}]},
+        model,
+    )
+    assert actual == expected
+    assert actual < litellm.token_counter(model=model, text=data)
+
+
+@pytest.mark.asyncio
+async def test_responses_budget_counts_instructions_and_tools_with_raw_body() -> None:
+    tool: Final = {"name": "inspect", "description": "Inspect", "parameters": {"type": "object", "properties": {}}}
+    body: Final = {
+        "model": "gpt-6-astra",
+        "instructions": "Always describe the image accurately. " * 100,
+        "input": [{"role": "user", "content": "Describe"}],
+        "tools": [{"type": "function", **tool}],
+    }
+    expected: Final = litellm.token_counter(
+        model=body["model"],
+        messages=[{"role": "system", "content": body["instructions"]}, {"role": "user", "content": "Describe"}],
+        tools=[{"type": "function", "function": tool}],
+    )
+    actual: Final = await count_request_input_tokens(body, "/v1/responses", None, json.dumps(body).encode())
+    assert dict(actual) == {body["model"]: expected}
 
 
 @pytest.fixture()
